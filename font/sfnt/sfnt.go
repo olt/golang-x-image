@@ -89,6 +89,7 @@ var (
 	errInvalidNameTable       = errors.New("sfnt: invalid name table")
 	errInvalidOS2Table        = errors.New("sfnt: invalid OS/2 table")
 	errInvalidPostTable       = errors.New("sfnt: invalid post table")
+	errInvalidGPOSTable       = errors.New("sfnt: invalid GPOS table")
 	errInvalidSingleFont      = errors.New("sfnt: invalid single font (data is a font collection)")
 	errInvalidSourceData      = errors.New("sfnt: invalid source data")
 	errInvalidTableOffset     = errors.New("sfnt: invalid table offset")
@@ -101,6 +102,7 @@ var (
 	errUnsupportedCompoundGlyph        = errors.New("sfnt: unsupported compound glyph")
 	errUnsupportedGlyphDataLength      = errors.New("sfnt: unsupported glyph data length")
 	errUnsupportedKernTable            = errors.New("sfnt: unsupported kern table")
+	errUnsupportedGPOSTable            = errors.New("sfnt: unsupported GPOS table")
 	errUnsupportedRealNumberEncoding   = errors.New("sfnt: unsupported real number encoding")
 	errUnsupportedNumberOfCmapSegments = errors.New("sfnt: unsupported number of cmap segments")
 	errUnsupportedNumberOfFontDicts    = errors.New("sfnt: unsupported number of font dicts")
@@ -112,6 +114,9 @@ var (
 	errUnsupportedPostTable            = errors.New("sfnt: unsupported post table")
 	errUnsupportedTableOffsetLength    = errors.New("sfnt: unsupported table offset or length")
 	errUnsupportedType2Charstring      = errors.New("sfnt: unsupported Type 2 Charstring")
+	errUnsupportedCoverageFormat       = errors.New("sfnt: unsupported coverage format")
+	errUnsupportedClassDefFormat       = errors.New("sfnt: unsupported class definition format")
+	errUnsupportedExtensionPosFormat   = errors.New("sfnt: unsupported extension positioning format")
 )
 
 // GlyphIndex is a glyph index in a Font.
@@ -242,6 +247,33 @@ func (s *source) view(buf []byte, offset, length int) ([]byte, error) {
 		return nil, err
 	}
 	return buf, nil
+}
+
+// varLenView returns bytes from the given offset for sub-tables with varying
+// length. The length of bytes is determined by staticLength plus n*itemLength,
+// where n is read as uint16 from countOffset (relative to offset). buf is an
+// optional scratch buffer (see source.view())
+func (s *source) varLenView(buf []byte, offset, staticLength, countOffset, itemLength int) ([]byte, int, error) {
+	if 0 > offset || offset > offset+staticLength {
+		return nil, 0, errInvalidBounds
+	}
+	if 0 > countOffset || countOffset+1 >= staticLength {
+		return nil, 0, errInvalidBounds
+	}
+
+	// read static part which contains our count
+	buf, err := s.view(buf, offset, staticLength)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	count := int(u16(buf[countOffset:]))
+	buf, err = s.view(buf, offset, staticLength+count*itemLength)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return buf, count, nil
 }
 
 // u16 returns the uint16 in the table t at the relative offset i.
@@ -558,6 +590,7 @@ type Font struct {
 	// "Advanced Typographic Tables".
 	//
 	// TODO: base, gdef, gpos, gsub, jstf, math?
+	gpos table
 
 	// https://www.microsoft.com/typography/otspec/otff.htm#otttables
 	// "Other OpenType Tables".
@@ -577,6 +610,7 @@ type Font struct {
 		isPostScript     bool
 		kernNumPairs     int32
 		kernOffset       int32
+		kernFuncs        []kernFunc
 		lineGap          int32
 		numHMetrics      int32
 		post             *PostTable
@@ -629,6 +663,10 @@ func (f *Font) initialize(offset int, isDfont bool) error {
 	if err != nil {
 		return err
 	}
+	buf, kernFuncs, err := f.parseGPOSKern(buf)
+	if err != nil {
+		return err
+	}
 	buf, ascent, descent, lineGap, run, rise, numHMetrics, err := f.parseHhea(buf, numGlyphs)
 	if err != nil {
 		return err
@@ -657,6 +695,7 @@ func (f *Font) initialize(offset int, isDfont bool) error {
 	f.cached.isPostScript = isPostScript
 	f.cached.kernNumPairs = kernNumPairs
 	f.cached.kernOffset = kernOffset
+	f.cached.kernFuncs = kernFuncs
 	f.cached.lineGap = lineGap
 	f.cached.numHMetrics = numHMetrics
 	f.cached.post = post
@@ -767,6 +806,8 @@ func (f *Font) initializeTables(offset int, isDfont bool) (buf1 []byte, isPostSc
 			f.name = table{o, n}
 		case 0x706f7374:
 			f.post = table{o, n}
+		case 0x47504f53:
+			f.gpos = table{o, n}
 		}
 	}
 	return buf, isPostScript, nil
@@ -1488,6 +1529,27 @@ func (f *Font) GlyphAdvance(b *Buffer, x GlyphIndex, ppem fixed.Int26_6, h font.
 //
 // It returns ErrNotFound if either glyph index is out of range.
 func (f *Font) Kern(b *Buffer, x0, x1 GlyphIndex, ppem fixed.Int26_6, h font.Hinting) (fixed.Int26_6, error) {
+
+	if f.cached.kernFuncs != nil {
+		for _, kf := range f.cached.kernFuncs {
+			adv, err := kf(x0, x1)
+			if err == ErrNotFound {
+				continue
+			}
+			if err != nil {
+				return 0, err
+			}
+			kern := fixed.Int26_6(adv)
+			kern = scale(kern*ppem, f.cached.unitsPerEm)
+			if h == font.HintingFull {
+				// Quantize the fixed.Int26_6 value to the nearest pixel.
+				kern = (kern + 32) &^ 63
+			}
+			return kern, nil
+		}
+		return 0, ErrNotFound
+	}
+
 	// TODO: how should this work with the GPOS table and CFF fonts?
 	// https://www.microsoft.com/typography/otspec/kern.htm says that
 	// "OpenType™ fonts containing CFF outlines are not supported by the 'kern'
