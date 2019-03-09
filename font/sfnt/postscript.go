@@ -528,6 +528,8 @@ func (d *psPrivateDictData) initialize() {
 
 // psType2CharstringsData contains fields specific to the Type 2 Charstrings
 // context.
+// TODO: Change from int32 types to Int26_6. Type 2 Charstrings cannot exceed
+// int16, but can contain 16.16 fix points.
 type psType2CharstringsData struct {
 	f          *Font
 	b          *Buffer
@@ -790,10 +792,14 @@ func (p *psInterpreter) parseNumber() (hasResult bool, err error) {
 		number, hasResult = -int32(b-251)*256-int32(b1)-108, true
 
 	case b == 255 && p.ctx == psContextType2Charstring:
+		// https://docs.microsoft.com/en-us/typography/opentype/spec/cff2charstr#Table1
+		// next 4 bytes contain 16-bit signed integer with 16 bits of fraction
 		if len(p.instructions) < 5 {
 			return true, errInvalidCFFTable
 		}
-		number, hasResult = int32(u32(p.instructions[1:])), true
+		// TODO: psType2CharstringsData only supports int32. Only use integer
+		// part for now.
+		number, hasResult = int32(int16(u16(p.instructions[1:]))), true
 		p.instructions = p.instructions[5:]
 	}
 
