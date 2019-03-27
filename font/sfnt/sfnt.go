@@ -609,8 +609,6 @@ type Font struct {
 		indexToLocFormat bool // false means short, true means long.
 		isColorBitmap    bool
 		isPostScript     bool
-		kernNumPairs     int32
-		kernOffset       int32
 		kernFuncs        []kernFunc
 		lineGap          int32
 		numHMetrics      int32
@@ -660,13 +658,16 @@ func (f *Font) initialize(offset int, isDfont bool) error {
 	if err != nil {
 		return err
 	}
-	buf, kernNumPairs, kernOffset, err := f.parseKern(buf)
-	if err != nil {
-		return err
-	}
 	buf, kernFuncs, err := f.parseGPOSKern(buf)
 	if err != nil {
 		return err
+	}
+	if kernFuncs == nil {
+		// only use KERN table if there was no suitable kerning in GPOS
+		buf, kernFuncs, err = f.parseKern(buf)
+		if err != nil {
+			return err
+		}
 	}
 	buf, ascent, descent, lineGap, run, rise, numHMetrics, err := f.parseHhea(buf, numGlyphs)
 	if err != nil {
@@ -694,8 +695,6 @@ func (f *Font) initialize(offset int, isDfont bool) error {
 	f.cached.indexToLocFormat = indexToLocFormat
 	f.cached.isColorBitmap = isColorBitmap
 	f.cached.isPostScript = isPostScript
-	f.cached.kernNumPairs = kernNumPairs
-	f.cached.kernOffset = kernOffset
 	f.cached.kernFuncs = kernFuncs
 	f.cached.lineGap = lineGap
 	f.cached.numHMetrics = numHMetrics
@@ -957,19 +956,19 @@ func (f *Font) parseHmtx(buf []byte, numGlyphs, numHMetrics int32) (buf1 []byte,
 	return buf, nil
 }
 
-func (f *Font) parseKern(buf []byte) (buf1 []byte, kernNumPairs, kernOffset int32, err error) {
+func (f *Font) parseKern(buf []byte) ([]byte, []kernFunc, error) {
 	// https://www.microsoft.com/typography/otspec/kern.htm
 
 	if f.kern.length == 0 {
-		return buf, 0, 0, nil
+		return buf, nil, nil
 	}
 	const headerSize = 4
 	if f.kern.length < headerSize {
-		return nil, 0, 0, errInvalidKernTable
+		return nil, nil, errInvalidKernTable
 	}
-	buf, err = f.src.view(buf, int(f.kern.offset), headerSize)
+	buf, err := f.src.view(buf, int(f.kern.offset), headerSize)
 	if err != nil {
-		return nil, 0, 0, err
+		return nil, nil, err
 	}
 	offset := int(f.kern.offset) + headerSize
 	length := int(f.kern.length) - headerSize
@@ -977,15 +976,19 @@ func (f *Font) parseKern(buf []byte) (buf1 []byte, kernNumPairs, kernOffset int3
 	switch version := u16(buf); version {
 	case 0:
 		if numTables := int(u16(buf[2:])); numTables == 0 {
-			return buf, 0, 0, nil
+			return buf, nil, nil
 		} else if numTables > 1 {
 			// TODO: support multiple subtables. For now, fall through and use
 			// only the first one.
 		}
-		return f.parseKernVersion0(buf, offset, length)
+		buf, kern, err := f.parseKernVersion0(buf, offset, length)
+		if kern != nil && err == nil {
+			return buf, []kernFunc{kern}, nil
+		}
+		return buf, nil, err
 	case 1:
 		if buf[2] != 0 || buf[3] != 0 {
-			return nil, 0, 0, errUnsupportedKernTable
+			return nil, nil, errUnsupportedKernTable
 		}
 		// Microsoft's https://www.microsoft.com/typography/otspec/kern.htm
 		// says that "Apple has extended the definition of the 'kern' table to
@@ -997,30 +1000,30 @@ func (f *Font) parseKern(buf []byte) (buf1 []byte, kernNumPairs, kernOffset int3
 		// behavior and simply ignore it. Theoretically, we could follow
 		// https://developer.apple.com/fonts/TrueType-Reference-Manual/RM06/Chap6kern.html
 		// but it doesn't seem worth the effort.
-		return buf, 0, 0, nil
+		return buf, nil, nil
 	}
-	return nil, 0, 0, errUnsupportedKernTable
+	return nil, nil, errUnsupportedKernTable
 }
 
-func (f *Font) parseKernVersion0(buf []byte, offset, length int) (buf1 []byte, kernNumPairs, kernOffset int32, err error) {
+func (f *Font) parseKernVersion0(buf []byte, offset, length int) ([]byte, kernFunc, error) {
 	const headerSize = 6
 	if length < headerSize {
-		return nil, 0, 0, errInvalidKernTable
+		return nil, nil, errInvalidKernTable
 	}
-	buf, err = f.src.view(buf, offset, headerSize)
+	buf, err := f.src.view(buf, offset, headerSize)
 	if err != nil {
-		return nil, 0, 0, err
+		return nil, nil, err
 	}
 	if version := u16(buf); version != 0 {
-		return nil, 0, 0, errUnsupportedKernTable
+		return nil, nil, errUnsupportedKernTable
 	}
 	subtableLengthU16 := u16(buf[2:])
 	if int(subtableLengthU16) < headerSize || length < int(subtableLengthU16) {
-		return nil, 0, 0, errInvalidKernTable
+		return nil, nil, errInvalidKernTable
 	}
 	if coverageBits := buf[5]; coverageBits != 0x01 {
 		// We only support horizontal kerning.
-		return nil, 0, 0, errUnsupportedKernTable
+		return nil, nil, errUnsupportedKernTable
 	}
 	offset += headerSize
 	length -= headerSize
@@ -1034,19 +1037,19 @@ func (f *Font) parseKernVersion0(buf []byte, offset, length int) (buf1 []byte, k
 		// a comment in the equivalent FreeType code (sfnt/ttkern.c) says that
 		// they've never seen such a font.
 	}
-	return nil, 0, 0, errUnsupportedKernTable
+	return nil, nil, errUnsupportedKernTable
 }
 
-func (f *Font) parseKernFormat0(buf []byte, offset, length int, subtableLengthU16 uint16) (buf1 []byte, kernNumPairs, kernOffset int32, err error) {
+func (f *Font) parseKernFormat0(buf []byte, offset, length int, subtableLengthU16 uint16) ([]byte, kernFunc, error) {
 	const headerSize, entrySize = 8, 6
 	if length < headerSize {
-		return nil, 0, 0, errInvalidKernTable
+		return nil, nil, errInvalidKernTable
 	}
-	buf, err = f.src.view(buf, offset, headerSize)
+	buf, err := f.src.view(buf, offset, headerSize)
 	if err != nil {
-		return nil, 0, 0, err
+		return nil, nil, err
 	}
-	kernNumPairs = int32(u16(buf))
+	kernNumPairs := int32(u16(buf))
 
 	// The subtable length from the kern table is only uint16. Fonts like
 	// Cambria, Calibri or Corbel have more then 10k kerning pairs and the
@@ -1054,9 +1057,53 @@ func (f *Font) parseKernFormat0(buf []byte, offset, length int, subtableLengthU1
 	// length and truncated size with subtable length.
 	n := headerSize + entrySize*int(kernNumPairs)
 	if (length < n) || (subtableLengthU16 != uint16(n)) {
-		return nil, 0, 0, errInvalidKernTable
+		return nil, nil, errInvalidKernTable
 	}
-	return buf, kernNumPairs, int32(offset) + headerSize, nil
+
+	if kernNumPairs == 0 {
+		return buf, nil, nil
+	}
+
+	kernOffset := int32(offset) + headerSize
+
+	kern := func(b *Buffer, x0, x1 GlyphIndex) (int16, error) {
+		if n := f.NumGlyphs(); int(x0) >= n || int(x1) >= n {
+			return 0, ErrNotFound
+		}
+
+		if b == nil {
+			b = &Buffer{}
+		}
+
+		key := uint32(x0)<<16 | uint32(x1)
+		lo, hi := int32(0), kernNumPairs
+		for lo < hi {
+			i := (lo + hi) / 2
+
+			// TODO: this view call inside the inner loop can lead to many small
+			// reads instead of fewer larger reads, which can be expensive. We
+			// should be able to do better, although we don't want to make (one)
+			// arbitrarily large read. Perhaps we should round up reads to 4K or 8K
+			// chunks. For reference, Arial.ttf's kern table is 5472 bytes.
+			// Times_New_Roman.ttf's kern table is 5220 bytes.
+			const entrySize = 6
+			buf, err := b.view(&f.src, int(kernOffset+i*entrySize), entrySize)
+			if err != nil {
+				return 0, err
+			}
+
+			k := u32(buf)
+			if k < key {
+				lo = i + 1
+			} else if k > key {
+				hi = i
+			} else {
+				return int16(u16(buf[4:])), nil
+			}
+		}
+		return 0, nil
+	}
+	return buf, kern, nil
 }
 
 func (f *Font) parseMaxp(buf []byte, isPostScript bool) (buf1 []byte, numGlyphs int32, err error) {
@@ -1645,84 +1692,37 @@ func (f *Font) GlyphMetrics(b *Buffer, x GlyphIndex, ppem fixed.Int26_6, h font.
 	}, nil
 }
 
+// kernFunc returns the unscaled kerning value for kerning pair x0+x1.
+// Returns ErrNotFound if no kerning is specified for this pair.
+type kernFunc func(b *Buffer, x0, x1 GlyphIndex) (int16, error)
+
 // Kern returns the horizontal adjustment for the kerning pair (x0, x1). A
 // positive kern means to move the glyphs further apart. ppem is the number of
 // pixels in 1 em.
 //
 // It returns ErrNotFound if either glyph index is out of range.
 func (f *Font) Kern(b *Buffer, x0, x1 GlyphIndex, ppem fixed.Int26_6, h font.Hinting) (fixed.Int26_6, error) {
-
-	// Use GPOS kern tables if available.
-	if f.cached.kernFuncs != nil {
-		for _, kf := range f.cached.kernFuncs {
-			adv, err := kf(x0, x1)
-			if err == ErrNotFound {
-				continue
-			}
-			if err != nil {
-				return 0, err
-			}
-			kern := fixed.Int26_6(adv)
-			kern = scale(kern*ppem, f.cached.unitsPerEm)
-			if h == font.HintingFull {
-				// Quantize the fixed.Int26_6 value to the nearest pixel.
-				kern = (kern + 32) &^ 63
-			}
-			return kern, nil
-		}
-		return 0, ErrNotFound
-	}
-
-	// Fallback to kern table.
-
-	// TODO: Convert kern table handling into kernFunc and decide in Parse if
-	// GPOS or kern should be used.
-
-	if n := f.NumGlyphs(); int(x0) >= n || int(x1) >= n {
-		return 0, ErrNotFound
-	}
-	// Not every font has a kern table. If it doesn't, or if that table is
-	// ignored, there's no need to allocate a Buffer.
-	if f.cached.kernNumPairs == 0 {
+	if f.cached.kernFuncs == nil {
 		return 0, nil
 	}
-	if b == nil {
-		b = &Buffer{}
-	}
 
-	key := uint32(x0)<<16 | uint32(x1)
-	lo, hi := int32(0), f.cached.kernNumPairs
-	for lo < hi {
-		i := (lo + hi) / 2
-
-		// TODO: this view call inside the inner loop can lead to many small
-		// reads instead of fewer larger reads, which can be expensive. We
-		// should be able to do better, although we don't want to make (one)
-		// arbitrarily large read. Perhaps we should round up reads to 4K or 8K
-		// chunks. For reference, Arial.ttf's kern table is 5472 bytes.
-		// Times_New_Roman.ttf's kern table is 5220 bytes.
-		const entrySize = 6
-		buf, err := b.view(&f.src, int(f.cached.kernOffset+i*entrySize), entrySize)
+	for _, kf := range f.cached.kernFuncs {
+		adv, err := kf(b, x0, x1)
+		if err == ErrNotFound {
+			continue
+		}
 		if err != nil {
 			return 0, err
 		}
-
-		k := u32(buf)
-		if k < key {
-			lo = i + 1
-		} else if k > key {
-			hi = i
-		} else {
-			kern := fixed.Int26_6(int16(u16(buf[4:])))
-			kern = scale(kern*ppem, f.cached.unitsPerEm)
-			if h == font.HintingFull {
-				// Quantize the fixed.Int26_6 value to the nearest pixel.
-				kern = (kern + 32) &^ 63
-			}
-			return kern, nil
+		kern := fixed.Int26_6(adv)
+		kern = scale(kern*ppem, f.cached.unitsPerEm)
+		if h == font.HintingFull {
+			// Quantize the fixed.Int26_6 value to the nearest pixel.
+			kern = (kern + 32) &^ 63
 		}
+		return kern, nil
 	}
-	return 0, nil
+	return 0, ErrNotFound
 }
 
 // Metrics returns the metrics of this font.

@@ -14,10 +14,6 @@ const (
 	hexFeatureKern = uint32(0x6b65726e) // kern
 )
 
-//kernFunc returns the unscaled kerning value for kerning pair a+b.
-// Returns ErrNotFound if no kerning is specified for this pair.
-type kernFunc func(a, b GlyphIndex) (int16, error)
-
 func (f *Font) parseGPOSKern(buf []byte) ([]byte, []kernFunc, error) {
 	// https://docs.microsoft.com/en-us/typography/opentype/spec/gpos
 
@@ -327,8 +323,8 @@ func (f *Font) parseGPOSFeaturesLookup(buf []byte, offset int, featureIdxs []int
 func makeCachedPairPosGlyph(cov indexLookupFunc, num int, buf []byte) kernFunc {
 	glyphs := make([]byte, len(buf))
 	copy(glyphs, buf)
-	return func(a, b GlyphIndex) (int16, error) {
-		idx, found := cov(a)
+	return func(b *Buffer, x0, x1 GlyphIndex) (int16, error) {
+		idx, found := cov(x0)
 		if !found {
 			return 0, ErrNotFound
 		}
@@ -343,10 +339,10 @@ func makeCachedPairPosGlyph(cov indexLookupFunc, num int, buf []byte) kernFunc {
 		count := int(u16(glyphs[offset:]))
 		for i := 0; i < count; i++ {
 			secondGlyphIndex := GlyphIndex(int(u16(glyphs[offset+2+i*4:])))
-			if secondGlyphIndex == b {
+			if secondGlyphIndex == x1 {
 				return int16(u16(glyphs[offset+2+i*4+2:])), nil
 			}
-			if secondGlyphIndex > b {
+			if secondGlyphIndex > x1 {
 				return 0, ErrNotFound
 			}
 		}
@@ -358,14 +354,14 @@ func makeCachedPairPosGlyph(cov indexLookupFunc, num int, buf []byte) kernFunc {
 func makeCachedPairPosClass(cov indexLookupFunc, num1, num2 int, cdef1, cdef2 classLookupFunc, buf []byte) kernFunc {
 	glyphs := make([]byte, len(buf))
 	copy(glyphs, buf)
-	return func(a, b GlyphIndex) (int16, error) {
+	return func(b *Buffer, x0, x1 GlyphIndex) (int16, error) {
 		// check coverage to avoid selection of default class 0
-		_, found := cov(a)
+		_, found := cov(x0)
 		if !found {
 			return 0, ErrNotFound
 		}
-		idxa := cdef1(a)
-		idxb := cdef2(b)
+		idxa := cdef1(x0)
+		idxb := cdef2(x1)
 		return int16(u16(glyphs[(idxb+idxa*num2)*2:])), nil
 	}
 }
