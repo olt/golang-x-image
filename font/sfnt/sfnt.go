@@ -23,6 +23,7 @@ import (
 	"errors"
 	"image"
 	"io"
+	"math"
 
 	"golang.org/x/image/font"
 	"golang.org/x/image/math/fixed"
@@ -1363,6 +1364,7 @@ func (f *Font) LoadGlyph(b *Buffer, x GlyphIndex, ppem fixed.Int26_6, opts *Load
 		b = &Buffer{}
 	}
 
+	b.box = [4]int16{}
 	b.segments = b.segments[:0]
 	if f.cached.isColorBitmap {
 		return nil, ErrColoredGlyph
@@ -1527,6 +1529,120 @@ func (f *Font) GlyphAdvance(b *Buffer, x GlyphIndex, ppem fixed.Int26_6, h font.
 		adv = (adv + 32) &^ 63
 	}
 	return adv, nil
+}
+
+// GlyphMetrics contain the metrics of a single glyph in pixel for a specific
+// size and resolution (ppem).
+type GlyphMetrics struct {
+	// AdvanceX is the distance on the baseline from the origin of this glyph
+	// to the next glyph origin.
+	AdvanceX fixed.Int26_6
+	// Width is the width of the glyph without spacing.
+	Width fixed.Int26_6
+	// LSB is the left-side bearing, the space between the origin and the left
+	// side of the glyph. Can be negative.
+	LSB fixed.Int26_6
+	// RSB is the right-side bearing, the space between the origin and the
+	// right side of the glyph. Can be negative.
+	RSB fixed.Int26_6
+
+	// TODO: also include ppem?
+}
+
+// GlyphMetrics returns the metrics for the x'th glyph. ppem is the
+// number of pixels in 1 em.
+//
+// It returns ErrNotFound if the glyph index is out of range.
+func (f *Font) GlyphMetrics(b *Buffer, x GlyphIndex, ppem fixed.Int26_6, h font.Hinting) (GlyphMetrics, error) {
+	if int(x) >= f.NumGlyphs() {
+		return GlyphMetrics{}, ErrNotFound
+	}
+	if b == nil {
+		b = &Buffer{}
+	}
+
+	// https://www.microsoft.com/typography/OTSPEC/hmtx.htm says that "As an
+	// optimization, the number of records can be less than the number of
+	// glyphs, in which case the advance width value of the last record applies
+	// to all remaining glyph IDs."
+	if n := GlyphIndex(f.cached.numHMetrics - 1); x > n {
+		x = n
+	}
+	// TODO https://docs.microsoft.com/en-us/typography/opentype/spec/hmtx
+	// If the longHorMetric array is less than the total number of glyphs, then
+	// that array is followed by an array for the left side bearing values of
+	// the remaining glyphs. The number of elements in the left side bearing
+	// will be derived from numberOfHMetrics plus the numGlyphs field in the
+	// 'maxp' table.
+
+	buf, err := b.view(&f.src, int(f.hmtx.offset)+int(4*x), 4)
+	if err != nil {
+		return GlyphMetrics{}, err
+	}
+	adv := fixed.Int26_6(u16(buf))
+	adv = scale(adv*ppem, f.cached.unitsPerEm)
+	lsb := fixed.Int26_6(int16(u16(buf[2:])))
+	lsb = scale(lsb*ppem, f.cached.unitsPerEm)
+
+	if h == font.HintingFull {
+		// Quantize the fixed.Int26_6 value to the nearest pixel.
+		adv = (adv + 32) &^ 63
+		lsb = (lsb + 32) &^ 63
+	}
+
+	seg, err := f.LoadGlyph(b, x, ppem, &LoadGlyphOptions{})
+	if err != nil {
+		return GlyphMetrics{}, err
+	}
+	var minX, maxX fixed.Int26_6
+
+	if f.cached.isPostScript {
+		// xMin/xMax and side bearings are implicitly contained within the
+		// CharString data and must be obtained from the rasterizer.
+		// Calculate extents from segments.
+
+		// TODO: quadratic/cubic segments can go beyond the extent if control
+		// points are outside of the extent.
+		minX = fixed.Int26_6(math.MaxInt32)
+		maxX = fixed.Int26_6(math.MinInt32)
+
+		for _, s := range seg {
+			idx := 0
+			switch s.Op {
+			case SegmentOpQuadTo:
+				idx = 1
+			case SegmentOpCubeTo:
+				idx = 2
+			}
+
+			if s.Args[idx].X > maxX {
+				maxX = s.Args[idx].X
+			}
+			if s.Args[idx].X < minX {
+				minX = s.Args[idx].X
+			}
+		}
+
+		// lsb = minX
+		// TODO: use minX as lsb when extent is calculated properly (see TODO above).
+		// However: Some layout engines may use left side bearing values in the
+		// 'hmtx' table, however; hence, font production tools should ensure
+		// that the lsb values in the 'hmtx' table match the implicit xMin
+		// values reflected in the CharString data.
+	} else {
+		// Use cached box from loadGlyf.
+		minX = scale(fixed.Int26_6(b.box[0])*ppem, f.cached.unitsPerEm)
+		maxX = scale(fixed.Int26_6(b.box[2])*ppem, f.cached.unitsPerEm)
+	}
+
+	// TODO: hinting?
+
+	return GlyphMetrics{
+		AdvanceX: adv,
+		RSB:      adv - (lsb + maxX - minX),
+		LSB:      lsb,
+		Width:    maxX - minX,
+	}, nil
 }
 
 // Kern returns the horizontal adjustment for the kerning pair (x0, x1). A
@@ -1734,6 +1850,9 @@ type Buffer struct {
 	// psi is a PostScript interpreter for when the Font is an OpenType/CFF
 	// font.
 	psi psInterpreter
+
+	// box contains the bounding rectangle for a glyph (xMin, yMin, xMax, yMax)
+	box [4]int16
 }
 
 func (b *Buffer) view(src *source, offset, length int) ([]byte, error) {

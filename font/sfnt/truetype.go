@@ -116,6 +116,11 @@ func loadGlyf(f *Font, b *Buffer, x GlyphIndex, stackBottom, recursionDepth uint
 		return errInvalidGlyphData
 	}
 
+	b.box[0] = int16(u16(data[2:]))
+	b.box[1] = int16(u16(data[4:]))
+	b.box[2] = int16(u16(data[6:]))
+	b.box[3] = int16(u16(data[8:]))
+
 	if numContours < 0 {
 		return loadCompoundGlyf(f, b, data[glyfHeaderLen:], stackBottom, recursionDepth)
 	}
